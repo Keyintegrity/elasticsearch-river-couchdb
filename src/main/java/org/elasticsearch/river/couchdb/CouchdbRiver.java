@@ -220,14 +220,14 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         indexerThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "couchdb_river_indexer").newThread(new Indexer());
         indexerThread.start();
         slurperThread.start();
-        new Timer(true).schedule(new TimerTask() {
-			
-			@Override
-			public void run() {
-				logger.info("Total lines: {}. [Index time: {}, lines in ms: {}], [Prapare time: {}, lines in ms: {}], [Net time: {}, lines in ms: {}]", lines_count, index_time/1e6, lines_count/(index_time/1e6), prepare_time/1e6, lines_count/(prepare_time/1e6), net_wait_time/1e6, lines_count/(net_wait_time/1e6));
-				logger.info("Slurper data available: {}", available);
-			}
-		}, 10000, 10000);
+//        new Timer(true).schedule(new TimerTask() {
+//			
+//			@Override
+//			public void run() {
+//				logger.info("Total lines: {}. [Index time: {}, lines in ms: {}], [Prapare time: {}, lines in ms: {}], [Net time: {}, lines in ms: {}]", lines_count, index_time/1e6, lines_count/(index_time/1e6), prepare_time/1e6, lines_count/(prepare_time/1e6), net_wait_time/1e6, lines_count/(net_wait_time/1e6));
+//				logger.info("Slurper data available: {}", available);
+//			}
+//		}, 10000, 10000);
     }
 
     @Override
@@ -243,7 +243,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 
     @SuppressWarnings({"unchecked"})
     private Object processLine(String s, BulkRequestBuilder bulk) {
-    	long start_time = System.nanoTime();
+    	//long start_time = System.nanoTime();
         Map<String, Object> ctx;
         try {
             ctx = XContentFactory.xContent(XContentType.JSON).createParser(s).mapAndClose();
@@ -342,8 +342,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         } else {
             logger.warn("ignoring unknown change {}", s);
         }
-        prepare_time += System.nanoTime() - start_time;
-        lines_count++;
+        //prepare_time += System.nanoTime() - start_time;
+        //lines_count++;
         return seq;
     }
 
@@ -370,11 +370,11 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         }
         return index;
     }
-	long index_time = 0;
-	long prepare_time = 0;
-	long lines_count = 0;
-	long net_wait_time = 0;
-    int available;
+//	long index_time = 0;
+//	long prepare_time = 0;
+//	long lines_count = 0;
+//	long net_wait_time = 0;
+//    int available;
 
 
     private class Indexer implements Runnable {
@@ -393,7 +393,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                     }
                     continue;
                 }
-                long start_time = System.nanoTime();
+                //long start_time = System.nanoTime();
                 BulkRequestBuilder bulk = client.prepareBulk();
                 Object lastSeq = null;
                 Object lineSeq = processLine(s, bulk);
@@ -402,11 +402,11 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 }
 
                 // spin a bit to see if we can get some more changes
-                long start = System.nanoTime();
+                //long start = System.nanoTime();
                 try {
                     while ((s = stream.poll(bulkTimeout.millis(), TimeUnit.MILLISECONDS)) != null) {
-                    	long diff = System.nanoTime() - start;
-                    	net_wait_time += diff;
+                    	//long diff = System.nanoTime() - start;
+                    	//net_wait_time += diff;
                     	//logger.info(("indexer wait time: {}"), diff/1e6);
                         lineSeq = processLine(s, bulk);
                         if (lineSeq != null) {
@@ -416,7 +416,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                         if (bulk.numberOfActions() >= bulkSize) {
                             break;
                         }
-                        start = System.nanoTime();
+                        //start = System.nanoTime();
                     }
                 } catch (InterruptedException e) {
                     if (closed) {
@@ -457,9 +457,9 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 }
 
                 try {
-                	int numberOfActions = bulk.numberOfActions();
+                	//int numberOfActions = bulk.numberOfActions();
                     BulkResponse response = bulk.execute().actionGet();
-                    index_time += System.nanoTime() - start_time;
+                    //index_time += System.nanoTime() - start_time;
                 	//logger.info("Total lines: {}({}). [Index time: {}, lines in ms: {}], [Prapare time: {}, lines in ms: {}], [Net time: {}, lines in ms: {}]", lines_count, numberOfActions, index_time/1e6, lines_count/(index_time/1e6), prepare_time/1e6, lines_count/(prepare_time/1e6), net_wait_time/1e6, lines_count/(net_wait_time/1e6));
 
                     if (response.hasFailures()) {
@@ -560,7 +560,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                     String line;
                     //long start = System.nanoTime();
                     while ((line = reader.readLine()) != null) {
-                    	available = is.available();
+                    	//available = is.available();
                     	//if (available>1000)
                     	//logger.info("Slurper data available: {}", available);
                         //long diff = System.nanoTime() - start;
