@@ -19,11 +19,12 @@
 
 package org.elasticsearch.river.couchdb;
 
+import static org.elasticsearch.client.Requests.deleteIndexRequest;
+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+
 import org.elasticsearch.common.settings.ImmutableSettings;
 import org.elasticsearch.node.Node;
 import org.elasticsearch.node.NodeBuilder;
-
-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 
 /**
  *
@@ -33,7 +34,13 @@ public class CouchdbRiverTest {
     public static void main(String[] args) throws Exception {
         Node node = NodeBuilder.nodeBuilder().settings(ImmutableSettings.settingsBuilder().put("gateway.type", "local")).node();
         Thread.sleep(1000);
-        node.client().prepareIndex("_river", "db", "_meta").setSource(jsonBuilder().startObject().field("type", "couchdb").endObject()).execute().actionGet();
+        node.client().admin().indices().delete(deleteIndexRequest("_river")).actionGet();
+        Thread.sleep(1000);
+        node.client().admin().indices().delete(deleteIndexRequest("db_tender_doc")).actionGet();
+        Thread.sleep(1000);
+        node.client().prepareIndex("_river", "db_tender_doc", "_meta").setSource(jsonBuilder().startObject().field("type", "couchdb").field("fieldToDermolize", "docs").endObject()).execute().actionGet();
+        Thread.sleep(1000);
+        node.client().prepareIndex("_river", "db_tender_doc", "_seq").setSource(jsonBuilder().startObject().startObject("couchdb").field("last_seq", "14845160").endObject().endObject()).execute().actionGet();
 
         Thread.sleep(1000000);
     }

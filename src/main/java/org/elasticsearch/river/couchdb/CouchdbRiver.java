@@ -19,6 +19,30 @@
 
 package org.elasticsearch.river.couchdb;
 
+import static org.elasticsearch.client.Requests.deleteRequest;
+import static org.elasticsearch.client.Requests.indexRequest;
+import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.UnsupportedEncodingException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.util.List;
+import java.util.Map;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLSession;
+
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
@@ -37,26 +61,13 @@ import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.XContentType;
 import org.elasticsearch.common.xcontent.support.XContentMapValues;
 import org.elasticsearch.indices.IndexAlreadyExistsException;
-import org.elasticsearch.river.*;
+import org.elasticsearch.river.AbstractRiverComponent;
+import org.elasticsearch.river.River;
+import org.elasticsearch.river.RiverIndexName;
+import org.elasticsearch.river.RiverName;
+import org.elasticsearch.river.RiverSettings;
 import org.elasticsearch.script.ExecutableScript;
 import org.elasticsearch.script.ScriptService;
-
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLSession;
-import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.TimeUnit;
-
-import static org.elasticsearch.client.Requests.deleteRequest;
-import static org.elasticsearch.client.Requests.indexRequest;
-import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 
 /**
  *
@@ -76,6 +87,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
     private final String basicAuth;
     private final boolean noVerify;
     private final boolean couchIgnoreAttachments;
+    private final TimeValue heartbeat;
+    private final TimeValue readTimeout;
 
     private final String indexName;
     private final String typeName;
@@ -88,6 +101,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
     private volatile Thread slurperThread;
     private volatile Thread indexerThread;
     private volatile boolean closed;
+
+    private final String fieldToDermolize;
 
     private final BlockingQueue<String> stream;
 
@@ -120,6 +135,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             } else {
                 couchFilterParamsUrl = null;
             }
+            heartbeat = XContentMapValues.nodeTimeValue(couchSettings.get("heartbeat"), TimeValue.timeValueSeconds(10));
+            readTimeout = XContentMapValues.nodeTimeValue(couchSettings.get("read_timeout"), TimeValue.timeValueSeconds(heartbeat.getSeconds()*3));
             couchIgnoreAttachments = XContentMapValues.nodeBooleanValue(couchSettings.get("ignore_attachments"), false);
             if (couchSettings.containsKey("user") && couchSettings.containsKey("password")) {
                 String user = couchSettings.get("user").toString();
@@ -139,17 +156,22 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             } else {
                 script = null;
             }
+            
+            fieldToDermolize = XContentMapValues.nodeStringValue(couchSettings.get("fieldToDermolize"), null);
         } else {
             couchProtocol = "http";
-            couchHost = "localhost";
+            couchHost = "192.168.0.248";
             couchPort = 5984;
-            couchDb = "db";
+            couchDb = "db_tender_doc";
             couchFilter = null;
             couchFilterParamsUrl = null;
             couchIgnoreAttachments = false;
+            heartbeat = TimeValue.timeValueSeconds(10);
+            readTimeout = TimeValue.timeValueSeconds(heartbeat.getSeconds()*3);
             noVerify = false;
             basicAuth = null;
             script = null;
+            fieldToDermolize = "docs";
         }
 
         if (settings.settings().containsKey("index")) {
@@ -198,6 +220,14 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         indexerThread = EsExecutors.daemonThreadFactory(settings.globalSettings(), "couchdb_river_indexer").newThread(new Indexer());
         indexerThread.start();
         slurperThread.start();
+        new Timer(true).schedule(new TimerTask() {
+			
+			@Override
+			public void run() {
+				logger.info("Total lines: {}. [Index time: {}, lines in ms: {}], [Prapare time: {}, lines in ms: {}], [Net time: {}, lines in ms: {}]", lines_count, index_time/1e6, lines_count/(index_time/1e6), prepare_time/1e6, lines_count/(prepare_time/1e6), net_wait_time/1e6, lines_count/(net_wait_time/1e6));
+				logger.info("Slurper data available: {}", available);
+			}
+		}, 10000, 10000);
     }
 
     @Override
@@ -213,6 +243,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 
     @SuppressWarnings({"unchecked"})
     private Object processLine(String s, BulkRequestBuilder bulk) {
+    	long start_time = System.nanoTime();
         Map<String, Object> ctx;
         try {
             ctx = XContentFactory.xContent(XContentType.JSON).createParser(s).mapAndClose();
@@ -247,6 +278,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             }
         }
 
+        id = (ctx.get("id") == null) ? null : ctx.get("id").toString();
+
         if (ctx.containsKey("ignore") && ctx.get("ignore").equals(Boolean.TRUE)) {
             // ignore dock
         } else if (ctx.containsKey("deleted") && ctx.get("deleted").equals(Boolean.TRUE)) {
@@ -256,6 +289,19 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 logger.trace("processing [delete]: [{}]/[{}]/[{}]", index, type, id);
             }
             bulk.add(deleteRequest(index).type(type).id(id).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+            if (fieldToDermolize != null) {
+                Map<String, Object> doc = (Map<String, Object>) ctx.get("doc");
+            	if (!doc.containsKey(fieldToDermolize) || !(doc.get(fieldToDermolize) instanceof List<?>)) {
+                    logger.warn("field for denormalize is not found or is not List. doc:{}", doc);
+                    return null;
+            	}
+	            for (int i = 0; i < ((List<Map<String, Object>>)doc.get(fieldToDermolize)).size(); i++) {
+	                bulk.add(deleteRequest(index).type(type).id(id + "_" + i).parent(id));
+				}
+            } else {
+                bulk.add(deleteRequest(index).type(type).id(id).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+            }
+
         } else if (ctx.containsKey("doc")) {
             String index = extractIndex(ctx);
             String type = extractType(ctx);
@@ -273,11 +319,31 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             if (logger.isTraceEnabled()) {
                 logger.trace("processing [index ]: [{}]/[{}]/[{}], source {}", index, type, id, doc);
             }
-
-            bulk.add(indexRequest(index).type(type).id(id).source(doc).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+            if (fieldToDermolize != null) {
+            	if (!doc.containsKey(fieldToDermolize) || !(doc.get(fieldToDermolize) instanceof List<?>)) {
+                    logger.warn("field for denormalize is not found or is not List. doc:{}", doc);
+                    return null;
+            	}
+	            int i = 0;
+	            for (Map<String, Object> nestDoc : (List<Map<String, Object>>)doc.get(fieldToDermolize)) {
+	            	for (java.util.Map.Entry<String, Object> docFld : doc.entrySet()) {
+	            		if ("_id".equals(docFld.getKey()) || 
+	            				"_rev".equals(docFld.getKey()) || 
+	            				docFld.getKey().equals(fieldToDermolize) || 
+	            				nestDoc.containsKey(docFld.getKey())) continue;
+	            		nestDoc.put(docFld.getKey(), docFld.getValue());
+					}
+	                bulk.add(indexRequest(index).type(type).id(id + "_" + i).source(nestDoc).routing(extractRouting(ctx)).parent(id));
+	                i++;
+				}
+            } else {
+            	bulk.add(indexRequest(index).type(type).id(id).source(doc).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+            }
         } else {
             logger.warn("ignoring unknown change {}", s);
         }
+        prepare_time += System.nanoTime() - start_time;
+        lines_count++;
         return seq;
     }
 
@@ -304,6 +370,12 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
         }
         return index;
     }
+	long index_time = 0;
+	long prepare_time = 0;
+	long lines_count = 0;
+	long net_wait_time = 0;
+    int available;
+
 
     private class Indexer implements Runnable {
         @Override
@@ -321,6 +393,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                     }
                     continue;
                 }
+                long start_time = System.nanoTime();
                 BulkRequestBuilder bulk = client.prepareBulk();
                 Object lastSeq = null;
                 Object lineSeq = processLine(s, bulk);
@@ -329,8 +402,12 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 }
 
                 // spin a bit to see if we can get some more changes
+                long start = System.nanoTime();
                 try {
                     while ((s = stream.poll(bulkTimeout.millis(), TimeUnit.MILLISECONDS)) != null) {
+                    	long diff = System.nanoTime() - start;
+                    	net_wait_time += diff;
+                    	//logger.info(("indexer wait time: {}"), diff/1e6);
                         lineSeq = processLine(s, bulk);
                         if (lineSeq != null) {
                             lastSeq = lineSeq;
@@ -339,6 +416,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                         if (bulk.numberOfActions() >= bulkSize) {
                             break;
                         }
+                        start = System.nanoTime();
                     }
                 } catch (InterruptedException e) {
                     if (closed) {
@@ -379,7 +457,11 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 }
 
                 try {
+                	int numberOfActions = bulk.numberOfActions();
                     BulkResponse response = bulk.execute().actionGet();
+                    index_time += System.nanoTime() - start_time;
+                	//logger.info("Total lines: {}({}). [Index time: {}, lines in ms: {}], [Prapare time: {}, lines in ms: {}], [Net time: {}, lines in ms: {}]", lines_count, numberOfActions, index_time/1e6, lines_count/(index_time/1e6), prepare_time/1e6, lines_count/(prepare_time/1e6), net_wait_time/1e6, lines_count/(net_wait_time/1e6));
+
                     if (response.hasFailures()) {
                         // TODO write to exception queue?
                         logger.warn("failed to execute" + response.buildFailureMessage());
@@ -393,7 +475,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 
 
     private class Slurper implements Runnable {
-        @SuppressWarnings({"unchecked"})
+
+		@SuppressWarnings({"unchecked"})
         @Override
         public void run() {
 
@@ -424,7 +507,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                     }
                 }
 
-                String file = "/" + couchDb + "/_changes?feed=continuous&include_docs=true&heartbeat=10000";
+                String file = "/" + couchDb + "/_changes?feed=continuous&include_docs=true&heartbeat=" + heartbeat.getMillis();
                 if (couchFilter != null) {
                     try {
                         file = file + "&filter=" + URLEncoder.encode(couchFilter, "UTF-8");
@@ -458,6 +541,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                         connection.addRequestProperty("Authorization", basicAuth);
                     }
                     connection.setDoInput(true);
+                    connection.setReadTimeout((int) readTimeout.getMillis());
                     connection.setUseCaches(false);
 
                     if (noVerify) {
@@ -474,7 +558,13 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 
                     final BufferedReader reader = new BufferedReader(new InputStreamReader(is, "UTF-8"));
                     String line;
+                    //long start = System.nanoTime();
                     while ((line = reader.readLine()) != null) {
+                    	available = is.available();
+                    	//if (available>1000)
+                    	//logger.info("Slurper data available: {}", available);
+                        //long diff = System.nanoTime() - start;
+                        //logger.info("Slurper wait time: {}", diff/1e6);
                         if (closed) {
                             return;
                         }
@@ -487,6 +577,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                         }
                         // we put here, so we block if there is no space to add
                         stream.put(line);
+                        //start = System.nanoTime();
                     }
                 } catch (Exception e) {
                     try {
